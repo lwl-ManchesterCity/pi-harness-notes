@@ -137,6 +137,23 @@ sessionManager
 
 `sessionDir` 只告诉 Pi 去哪个文件夹找 session，不代表已经选中了某个 session。
 
+还要区分“存放 session 的文件夹”和“某个 session 属于哪个项目”：
+
+```text
+sessionDir/
+  ├─ login-fix.jsonl  → cwd = project-a
+  ├─ refactor.jsonl   → cwd = project-b
+  └─ bug-123.jsonl    → cwd = project-a
+```
+
+```text
+sessionDir
+  → 存放很多 session 文件的文件夹
+
+session 的 cwd
+  → 某一个具体 session 属于哪个项目
+```
+
 ```text
 pi
   → 在 sessionDir 创建新 session 文件

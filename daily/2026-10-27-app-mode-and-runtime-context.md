@@ -41,6 +41,25 @@ json        → 程序读取每一步的 JSON 事件
 rpc         → 程序长期连续发送任务
 ```
 
+用户直接在终端运行 Pi 时，默认是 `interactive`：
+
+```bash
+pi
+pi --use-theme dark
+```
+
+下列情况会选择其他模式：
+
+```text
+pi --mode json ...      → json
+pi --mode rpc           → rpc
+echo "任务" | pi        → print
+pi "任务" > result.txt  → print
+pi --print "任务"       → print
+```
+
+`--use-theme dark` 只有在 `interactive` 模式下才生效。它只覆盖本次运行的主题，不会改写设置文件。
+
 非 `interactive` 模式下，Pi 会保护 stdout：正式结果留在 stdout，提示、日志和报错转到 stderr，避免污染外部程序读取的结果。
 
 例如：

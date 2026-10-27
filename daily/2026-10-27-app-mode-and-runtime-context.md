@@ -18,6 +18,8 @@ parseArgs(args)
   → 检查 RPC、session 参数组合
   → runMigrations(cwd)
   → 创建 SettingsManager
+  → 确定 sessionDir
+  → 创建或打开 SessionManager
 ```
 
 ## 输入
@@ -171,12 +173,41 @@ pi --fork login-fix
   → 复制指定 session 的历史，创建新 session 文件
 ```
 
+### sessionDir 的来源与缺失 cwd
+
+Pi 按以下优先级确定 session 文件夹：
+
+```text
+--session-dir 命令行参数
+  > PI_SESSION_DIR 环境变量
+  > 设置文件中的默认目录
+```
+
+之后 `createSessionManager(...)` 才从该文件夹中创建或选中具体 session。
+
+某些旧 session 文件可能没有记录自身所属项目的 `cwd`。交互模式下，Pi 会询问用户这个 session 应属于哪个项目；非交互模式无法提问，会报错退出。
+
+### 设置与 session 名称
+
+`SettingsManager.create(cwd, agentDir)` 会读取并合并：
+
+```text
+agentDir/settings.json     → 所有项目共用的全局设置
+cwd/.pi/settings.json      → 当前项目设置
+```
+
+项目设置优先于全局设置。读取或解析设置文件时发现的问题会收集为诊断信息，后续由 `main()` 决定何时显示。
+
+首次交互启动时，Pi 可显示主题与分析数据收集的设置向导。用户也可传入 `--use-theme dark`，仅在本次交互运行中覆盖主题，不写回设置文件。
+
+用户传入 `--name login-fix` 时，Pi 会为当前 session 写入便于识别的名称；空名称会报错。
+
 ## 下一步调用谁
 
-`runMigrations(cwd)` 后，`main.ts` 创建：
+接下来 `main.ts` 创建 `ProjectTrustStore`，开始判断当前项目的资源是否可信：
 
 ```ts
-const startupSettingsManager = SettingsManager.create(cwd, agentDir);
+const trustStore = new ProjectTrustStore(agentDir);
 ```
 
 ## 必要的 TypeScript
@@ -193,4 +224,4 @@ Agent 的核心逻辑应与交互外壳分离。同一个 Agent 可以服务于�
 
 ## 未解决问题
 
-- [ ] `SettingsManager.create(cwd, agentDir)` 分别从哪些文件读取设置？
+- [ ] 项目资源信任（project trust）为什么要在加载扩展前处理？

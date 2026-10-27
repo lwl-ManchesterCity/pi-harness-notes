@@ -120,6 +120,40 @@ agentDir
 
 恢复的内容是持久化的会话历史和配置，不包括上一次进程中所有临时运行状态。
 
+### sessionDir、session 文件与 --continue
+
+这三个概念不同：
+
+```text
+sessionDir
+  → 存放多个 session 文件的文件夹
+
+session 文件
+  → 一次具体对话的历史记录，例如 login-fix.jsonl
+
+sessionManager
+  → 管理本次选中 session 文件的对象
+```
+
+`sessionDir` 只告诉 Pi 去哪个文件夹找 session，不代表已经选中了某个 session。
+
+```text
+pi
+  → 在 sessionDir 创建新 session 文件
+
+pi --continue
+  → 在 sessionDir 找最近使用的 session 文件并打开
+
+pi --resume
+  → 列出旧 session，由用户选择一个
+
+pi --session login-fix
+  → 在 sessionDir 找指定的 session 文件
+
+pi --fork login-fix
+  → 复制指定 session 的历史，创建新 session 文件
+```
+
 ## 下一步调用谁
 
 `runMigrations(cwd)` 后，`main.ts` 创建：

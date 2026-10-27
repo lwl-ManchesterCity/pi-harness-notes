@@ -101,6 +101,25 @@ agentDir
 
 它们不是父子目录关系：多个项目的 `cwd` 会共用一个 `agentDir`。
 
+### 恢复会话与短期记忆的区别
+
+从项目 A 启动 Pi 后，用户可以选择恢复项目 B 的 session。此时 Pi 会读取 session B 已保存到磁盘的历史，并改用项目 B 的 cwd、设置、资源和模型配置；后续消息会追加到 session B，不会覆盖旧历史。
+
+这不是“短期记忆自动跨对话”：
+
+```text
+新的 session A 与 session B
+  → 默认互不共享历史
+
+恢复 session B
+  → 重新加载 session B 已保存的历史
+
+--fork session B
+  → 明确复制 B 的历史，创建一个新 session
+```
+
+恢复的内容是持久化的会话历史和配置，不包括上一次进程中所有临时运行状态。
+
 ## 下一步调用谁
 
 `runMigrations(cwd)` 后，`main.ts` 创建：

@@ -214,6 +214,74 @@ resolveModelScope(...)
 
 `scopedModels` 是“本次可从中选择的模型”，不是本次最终必定使用的模型；最终模型、思考等级和工具选项由后面的 `buildSessionOptions(...)` 组装。
 
+## `buildSessionOptions(...)`：从输入资料得到创建选项
+
+它定义在同一个 `main.ts` 的 `main()` 前面；当前主调用链走到这里时才调用它：
+
+```ts
+const {
+  options: sessionOptions,
+  cliThinkingFromModel,
+  diagnostics: sessionOptionDiagnostics,
+} = buildSessionOptions(
+  parsed,
+  scopedModels,
+  sessionManager.buildSessionContext().messages.length > 0,
+  modelRuntime,
+  settingsManager,
+);
+```
+
+它不是把五个参数直接打包成三个对象，而是：
+
+```text
+5 个输入资料
+→ 按模型、思考等级、工具等规则计算并校验
+→ 返回 3 个结果
+```
+
+五个输入：
+
+```text
+parsed
+→ 用户本次输入的 --model、--thinking、--tools 等已解析参数。
+
+scopedModels
+→ 前面确认过、当前实际可选的模型列表。
+
+sessionManager.buildSessionContext().messages.length > 0
+→ 当前 session 是否已有历史消息；true 表示旧 session，false 表示新 session。
+
+modelRuntime
+→ 查询模型、provider 与认证状态。
+
+settingsManager
+→ 读取默认模型、默认 provider 等设置。
+```
+
+三个返回结果：
+
+```text
+sessionOptions
+→ 对象：最终模型、思考等级、工具等创建选项。
+
+cliThinkingFromModel
+→ 布尔值：思考等级是否来自用户写在 --model 中的简写。
+
+sessionOptionDiagnostics
+→ 数组：模型或工具参数的错误、警告。
+```
+
+这里的 TypeScript “取字段并改名”：
+
+```ts
+options: sessionOptions
+// 等价于 const sessionOptions = 返回结果.options;
+
+diagnostics: sessionOptionDiagnostics
+// 等价于 const sessionOptionDiagnostics = 返回结果.diagnostics;
+```
+
 ## 必要的 TypeScript
 
 ```ts

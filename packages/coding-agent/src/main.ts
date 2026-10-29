@@ -572,16 +572,23 @@ export interface MainOptions {
 }
 
 export async function main(args: string[], options?: MainOptions) {
+	// 每次启动都从空的耗时记录开始，便于后续输出各启动阶段耗时。
 	resetTimings();
-	// Commands and startup selectors can load user-authored themes before runtime creation.
+	// 命令和启动选择器可能在创建运行时之前加载用户主题，因此先注册主题 JSON 校验器。
 	setThemeJsonValidator(validateThemeJson);
+	// 内置扩展始终存在；测试或嵌入调用方可额外提供扩展工厂。
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
+	// --offline 或环境变量会禁止网络相关启动行为。
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
 		process.env.PI_SKIP_VERSION_CHECK = "1";
 	}
 
+	// 先处理不需要启动 Agent 的管理命令。
+	// 命中任意一个命令后都会直接结束；只有普通任务才会继续创建 AgentSession。
+	// 例如：pi 帮我修复 bug 不会命中下面四个判断。
+	// 例如：pi auth check --provider openai 只检查凭证，不创建 Agent。
 	if (await runAuthCommand(args)) {
 		return;
 	}
@@ -593,16 +600,18 @@ export async function main(args: string[], options?: MainOptions) {
 
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
+	// 此阶段尚未确认项目是否可信，只读取启动所需的全局设置。
 	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher();
 
+	// 例如：pi update 用于更新 Pi 本身，更新完成后直接退出，不创建 Agent。
 	if (await handlePackageCommand(args, { extensionFactories })) {
 		const exitCode = process.exitCode ?? 0;
 		if (process.platform === "win32" && exitCode === 0 && args[0] === "update") {
-			// We normally prefer process.exit(0) for package commands so bad extensions cannot keep
-			// one-shot commands alive. On Windows, Node can assert after fetch() if process.exit(0)
-			// runs during teardown; let successful `pi update` drain naturally instead.
+			// 包管理命令通常使用 process.exit(0)，避免异常扩展让一次性命令无法退出。
+			// 但 Windows 上，fetch() 清理期间调用 process.exit(0) 可能触发 Node 断言；
+			// 因此成功的 pi update 改为让进程自然结束。
 			// https://github.com/nodejs/node/issues/56645
 			return;
 		}
@@ -610,33 +619,43 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
+	// 例如：pi config ... 用于读取或修改配置，完成后直接退出，不创建 Agent。
 	if (await handleConfigCommand(args, { extensionFactories })) {
 		return;
 	}
 
+	// 例如：pi mcp list 只管理 MCP 服务；第一个参数是 mcp 时才加载对应实现。
 	if (args[0] === "mcp") {
 		const { runMcpCommand } = await loadMcpCommand();
 		process.exitCode = await runMcpCommand(args.slice(1), { cwd, agentDir });
 		return;
 	}
-
+    // 进入到普通任务
+	// 把用户输入的字符串数组拆成结构化的选项、消息和诊断信息。
 	const parsed = parseArgs(args);
+	// diagnostics 不为空表示参数中有错误或警告，例如未知选项 --modle。
 	if (parsed.diagnostics.length > 0) {
+		// 逐条输出诊断：错误显示为红色，警告显示为黄色。
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;
 			console.error(color(`${d.type === "error" ? "Error" : "Warning"}: ${d.message}`));
 		}
+		// 只要存在一条错误，就停止启动；只有警告时仍可继续。
 		if (parsed.diagnostics.some((d) => d.type === "error")) {
 			process.exit(1);
 		}
 	}
+	// 记录“解析参数”这一步花了多少时间，用于启动耗时分析。
 	time("parseArgs");
 
+	// 用户输入 pi --version 时，只输出版本号并正常退出；普通任务会跳过这里继续向下执行。
 	if (parsed.version) {
 		console.log(VERSION);
 		process.exit(0);
 	}
 
+	// 用户输入 pi --export session.jsonl output.html 时，
+	// 将已保存的会话文件转换为浏览器可打开的 HTML；不启动 Agent。
 	if (parsed.export) {
 		let result: string;
 		try {
@@ -651,62 +670,92 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
+	// 决定这次如何与 Agent 交互，而不是决定创建哪一种 Agent：
+	// 人在终端持续聊天用 interactive；一次任务后退出用 print；
+	// 程序读取执行事件用 json；程序长期连续发送任务用 rpc。
+	// parsed 表示用户是否主动传入 --mode；stdin.isTTY 表示输入来自人还是管道；
+	// stdout.isTTY 表示输出直接显示给人，还是交给文件或其他程序。
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
+		// 系统原本就有 stdout（正式结果）和 stderr（提示、日志、报错）两条输出通道。
+		// 非交互模式下，将普通输出转到 stderr，保留 stdout 给外部程序读取正式结果。
 		takeOverStdout();
 	}
 
+	// RPC 模式通过 stdin 接收程序发送的命令，不能再使用 @文件 参数；
+	// 例如 pi --mode rpc @prompt.txt 会报错并以状态码 1 退出。
 	if (parsed.mode === "rpc" && parsed.fileArgs.length > 0) {
 		console.error(chalk.red("Error: @file arguments are not supported in RPC mode"));
 		process.exit(1);
 	}
 
+	// --fork 表示复制旧会话并创建新会话；不能同时要求直接打开或继续旧会话。
 	validateForkFlags(parsed);
+	// --session-id 表示指定会话 ID；不能与 --session、--continue、--resume 混用。
 	validateSessionIdFlags(parsed);
 
-	// Run migrations (pass cwd for project-local migrations)
+	// 启动前迁移旧数据：cwd 是当前项目目录，用于项目级 .pi/ 配置；
+	// agentDir 是所有项目共用的 Pi 全局目录，用于凭证、历史会话等全局数据。
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
 	time("runMigrations");
 
+	// 读取并合并两层设置：agentDir/settings.json 是所有项目共用的全局设置，
+	// cwd/.pi/settings.json 是当前项目的设置。
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
+	// 取出设置文件读取或格式错误产生的警告，后续由 main 决定何时显示。
 	const startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager);
 
-	// Experimental first-time setup: theme choice and analytics opt-in.
-	// Runs before any runtime services are created so the chosen settings apply everywhere.
+	// 实验性的首次启动设置：选择主题并决定是否启用分析数据收集。
+	// 必须在创建运行时服务前执行，才能让选择的设置在本次启动的所有位置生效。
 	if (appMode === "interactive" && !parsed.help && parsed.listModels === undefined && shouldRunFirstTimeSetup()) {
+		// 显示首次设置向导：选择主题，并决定是否启用分析数据收集；选择会保存到设置中。
 		await showFirstTimeSetup(startupSettingsManager);
+		// 仅记录首次设置这一步的启动耗时，不显示任何内容。
 		time("firstTimeSetup");
 	}
 
+	// 直接在终端运行 pi 时默认是 interactive；只有用户传入 --use-theme 时，
+	// 才在本次运行中覆盖主题，不写回设置文件。
 	if (appMode === "interactive" && parsed.useTheme !== undefined) {
 		startupSettingsManager.applyOverrides({ theme: parsed.useTheme });
 	}
 
-	// Decide the final runtime cwd before creating cwd-bound runtime services.
-	// --session and --resume may select a session from another project, so project-local
-	// settings, resources, provider registrations, and models must be resolved only after
-	// the target session cwd is known. The startup-cwd settings manager is used only for
-	// sessionDir lookup during session selection.
+	// 创建依赖 cwd 的运行时服务前，先确定这次最终使用哪个项目目录。
+	// --session 和 --resume 可能选中其他项目的会话；因此只有确定目标会话的 cwd 后，
+	// 才能读取该项目的设置、资源、provider 注册和模型。启动时创建的设置管理器
+	// 只在选择会话期间用于查找 sessionDir。
+	// 例如从项目 A 启动后恢复项目 B 的 session：后续按项目 B 的上下文运行，
+	// 新对话追加到该 session 的已保存历史中；如需复制历史并创建新会话，应使用 --fork。
+	// 读取环境变量 PI_SESSION_DIR；用户可用它指定 session 文件的存放目录。
 	const envSessionDir = process.env[ENV_SESSION_DIR];
+	// 按优先级确定 sessionDir：命令行 --session-dir > 环境变量 > 设置文件中的默认值。
+	// sessionDir 只是存放多个 session 文件的文件夹，不代表本次已选中某个具体 session。
 	const sessionDir =
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
+	// 根据用户的 --session、--resume、--fork 等参数，创建、打开或复制一个 session。
+	// 例如 --continue 会在 sessionDir 中选取最近使用的 session 文件。
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	// 旧 session 文件可能没有有效 cwd；先检查是否需要用户补选所属项目目录。
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
+			// 交互模式下询问用户选择哪个项目目录；取消则正常退出。
 			const selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
 			if (!selectedCwd) {
 				process.exit(0);
 			}
+			// 用用户选择的 cwd 重新打开同一个 session 文件。
 			sessionManager = SessionManager.open(missingSessionCwdIssue.sessionFile!, sessionDir, selectedCwd);
 		} else {
+			// 非交互模式无法提问，因此直接报告错误并退出。
 			console.error(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message));
 			process.exit(1);
 		}
 	}
+	// 用户传入 --name 时，为当前 session 写入一个便于识别的名称；空名称直接报错。
 	if (parsed.name !== undefined) {
 		const name = normalizeSessionName(parsed.name);
 		if (name === undefined) {
@@ -715,21 +764,34 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		sessionManager.appendSessionInfo(name);
 	}
+	// 仅记录创建、打开或复制 session 这一步的启动耗时。
 	time("createSessionManager");
 
+	// trustStore 保存在 Pi 全局目录中的“项目可信任记录”，不是可信任的 session 列表。
 	const trustStore = new ProjectTrustStore(agentDir);
+	// session 只提供它所属项目的目录；后续用这个目录查询该项目是否被信任。
 	const sessionCwd = sessionManager.getCwd();
+	// 用户未强制指定信任状态，且当前项目暂时没有需要确认的资源时，
+	// 记住该 cwd 交给交互界面；之后重新加载并出现此类资源时，才可保存本次隐式信任。
 	const autoTrustOnReloadCwd =
 		parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
 			? sessionCwd
 			: undefined;
+	// --help 和 --list-models 不显示交互式信任询问。
 	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
+	// 在本次 Pi 进程中缓存“项目目录 → 是否信任”，避免重新创建 runtime 时重复询问。
 	const projectTrustByCwd = new Map<string, boolean>();
 
+	// parsed 中这些字段来自用户可选的 --extension、--skill、--prompt-template、--theme 参数。
+	// 例如 cwd 是 /Users/lwl/Desktop/pi、用户传入 --skill ./skills 时，
+	// ./skills 会处理为 /Users/lwl/Desktop/pi/skills；这里只准备路径，尚未加载资源。
 	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+
+	// 定义“创建运行环境”的函数，暂不执行。调用方会传入一个资料对象；
+	// 参数中的 { cwd, agentDir, ... } 只是从该对象取出五个字段，不是解析用户命令。
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -737,24 +799,45 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionStartEvent,
 		projectTrustContext,
 	}) => {
+		// 没有已有的 session 启动事件，说明这是当前 session 第一次创建运行环境。
 		const isInitialRuntime = sessionStartEvent === undefined;
+		// 收集信任检查过程中的警告，后面会交给运行环境显示。
 		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
+		// 从本次 Pi 进程的缓存中，查询当前项目是否已做过信任判断；首次创建时通常没有结果。
 		const cachedProjectTrust = projectTrustByCwd.get(cwd);
+		// 检查整套项目资源中是否有需确认项：.pi/settings.json、扩展、技能、MCP、提示词等。
+		// 这决定是否需要项目级信任判断，不只检查 settings.json。
 		const hasTrustRequiringResources = hasTrustRequiringProjectResources(cwd);
+		// 只有用户没有强制指定、缓存没有结果、且项目确有此类资源时，才需要现在完成一次信任判断。
 		const shouldResolveProjectTrust =
 			parsed.projectTrustOverride === undefined && cachedProjectTrust === undefined && hasTrustRequiringResources;
+
+		// projectTrusted 是“现在能否读取当前项目 .pi/ 配置”的开关：true 可读，false 暂不读。
+		// 若仍需判断信任，先取 false 防止项目配置抢先加载；后面的服务创建流程会取得最终结果。
 		const projectTrusted = shouldResolveProjectTrust
 			? false
 			: (cachedProjectTrust ??
 				parsed.projectTrustOverride ??
 				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
+		// 创建设置管理器。它只负责 settings.json：projectTrusted 为 false 时仍读 Pi 全局设置，
+		// 但跳过 cwd/.pi/settings.json；扩展、技能等其余项目资源由后面的资源加载器按同一信任结果处理。
 		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+
+		// 调用已在别处定义的 createAgentSessionServices，不是在这里定义它；await 会等待它准备完成，
+		// 再将返回结果保存到 services。下面对象中的每个字段，都是准备服务时交给它的输入资料。
 		const services = await createAgentSessionServices({
+			// 当前 session 所属项目目录；从这里读取项目资源。
 			cwd,
+			// Pi 全局目录；从这里读取所有项目共用的设置、认证和数据。
 			agentDir,
+			// 已按当前信任状态创建的设置管理器；它决定能否读取项目 .pi/settings.json。
 			settingsManager: runtimeSettingsManager,
+			// 模型初始化最多等待 15 秒；超时则取消，避免 Pi 一直卡在启动阶段。
 			modelRuntimeSignal: AbortSignal.timeout(15_000),
+			// Pi 不认识、但用户可能传给扩展的命令行参数，例如扩展自定义的 --my-flag。
 			extensionFlagValues: parsed.unknownFlags,
+			// 仅当项目还需要做信任判断时提供：main 将“如何确认信任”的流程交给资源加载器。
+			// 资源加载器加载项目资源时需要确认才调用它；其中 resolveProjectTrusted 会查记录或弹窗并得出 true/false。
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
 				? {
 						resolveProjectTrust: async ({ extensionsResult }) => {
@@ -779,27 +862,40 @@ export async function main(args: string[], options?: MainOptions) {
 						},
 					}
 				: undefined,
+			// 告诉资源加载器：额外从哪里加载资源、以及用户通过命令行要求禁用哪些资源。
 			resourceLoaderOptions: {
+				// 用户通过 --extension、--skill、--prompt-template、--theme 指定的额外资源路径。
 				additionalExtensionPaths: resolvedExtensionPaths,
 				additionalSkillPaths: resolvedSkillPaths,
 				additionalPromptTemplatePaths: resolvedPromptTemplatePaths,
 				additionalThemePaths: resolvedThemePaths,
+				// 用户传入对应的 --no-* 参数时，禁止加载相应类别的项目资源。
 				noExtensions: parsed.noExtensions,
 				disabledBuiltinExtensions: parsed.noMcp ? ["mcp"] : undefined,
 				noSkills: parsed.noSkills,
 				noPromptTemplates: parsed.noPromptTemplates,
 				noThemes: parsed.noThemes,
 				noContextFiles: parsed.noContextFiles,
+				// 用户直接传入的系统提示词，以及要追加到默认系统提示词后的内容。
 				systemPrompt: parsed.systemPrompt,
 				appendSystemPrompt: parsed.appendSystemPrompt,
+				// Pi 内置扩展的创建方法；不是用户项目目录里的扩展文件。
 				extensionFactories,
 			},
 		});
+
+		// services 是刚准备好的工具箱；这里取出后续要单独使用的三项，未再次创建它们：
+		// settingsManager 读取最终设置；modelRuntime 管理 AI 模型和认证；resourceLoader 管理已加载的项目资源。
 		const { settingsManager, modelRuntime, resourceLoader } = services;
+
+		// 将启动过程各处发现的问题合并为 diagnostics，暂不直接输出；后面由运行环境统一显示。
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
+			// 信任判断、准备 services、读取设置时产生的问题；数组前的 ... 会把其中每一项直接放入 diagnostics，
+			// 而不是把整个数组作为 diagnostics 的一个元素。
 			...projectTrustDiagnostics,
 			...services.diagnostics,
 			...collectSettingsDiagnostics(settingsManager),
+			// 扩展加载器分别提供错误和警告；.map(...) 会把每一项扩展问题转换为 diagnostics 的 { type, message } 格式。
 			...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
 				type: "error" as const,
 				message: `Failed to load extension "${path}": ${error}`,
@@ -810,20 +906,35 @@ export async function main(args: string[], options?: MainOptions) {
 			})),
 		];
 
+		// 先确定本次允许从哪些模型中选择：用户传入 --models 时优先使用，否则读取设置中的默认启用模型。
+		// modelPatterns 只是“想允许的名单”，还未表示本次一定会选中其中某一个模型。
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
+		// 将名单与当前实际可用的模型（provider 和认证状态）对照，得到真正可选的 scopedModels。
+		// 没有模型名单时返回空数组；本段只划定可选范围，具体选哪个模型在后面的 buildSessionOptions 中决定。
 		const scopedModels =
 			modelPatterns && modelPatterns.length > 0
 				? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
 				: [];
+
+		// 调用同一文件前面定义的 buildSessionOptions：它会用下面 5 个输入计算并校验创建 session 的选项，
+		// 而不是简单地把 5 个参数打包。返回值有 3 项；这里同时从返回对象取出它们。
 		const {
+			// 返回对象的 options 字段，改名保存为 sessionOptions：最终模型、思考等级、工具等创建选项。
 			options: sessionOptions,
+			// true/false 标记：思考等级是否来自用户写在 --model 中的简写。
 			cliThinkingFromModel,
+			// 返回对象的 diagnostics 字段，改名保存为 sessionOptionDiagnostics：模型或工具参数的错误、警告。
 			diagnostics: sessionOptionDiagnostics,
 		} = buildSessionOptions(
+			// 用户本次输入的 --model、--thinking、--tools 等已解析参数。
 			parsed,
+			// 前面确认过的、当前实际可选模型列表。
 			scopedModels,
+			// 当前 session 是否已有历史消息：大于 0 为 true，表示这是旧 session；否则为新 session。
 			sessionManager.buildSessionContext().messages.length > 0,
+			// 查询模型信息、provider 与认证状态。
 			modelRuntime,
+			// 读取默认模型和默认 provider 等设置。
 			settingsManager,
 		);
 		diagnostics.push(...sessionOptionDiagnostics);

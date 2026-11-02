@@ -10,6 +10,18 @@
 - [每日笔记模板](daily/TEMPLATE.md)
 - [架构图说明](architecture/README.md)
 - [设计笔记说明](design-notes/README.md)
+- [Week 1 详细学习记录](daily/week-1-cli-agent-session.md)
+
+## 仓库结构
+
+```text
+daily/          每日学习笔记与模板
+architecture/   调用图、时序图和状态图
+design-notes/   从 Pi 提炼出的 Multi-Agent 设计判断
+pi-source/      完整 Pi 源码快照，以及学习时添加的中文注释
+```
+
+`pi-source/` 不包含本机的 `.git`、依赖目录或个人配置。公司电脑与家里主机都从本仓库拉取、修改和推送；中文注释与笔记会跟随同一次提交同步。
 
 ## 记录原则
 

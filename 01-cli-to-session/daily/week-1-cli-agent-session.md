@@ -1333,6 +1333,37 @@ allowedToolNames = ["read", "write"];
 
 本次 session 中，模型只能看到并调用 `read`、`write`。命令行是用户这次明确指定的要求，因此会覆盖“用户没有指定时才使用”的默认工具配置。
 
+### 用户文字与图片统一为内容块数组
+
+正常用户输入会先被 Pi 封装为内容块数组，再作为 user message 的 `content`：
+
+```text
+输入 hello
+→ content = [{ type: "text", text: "hello" }]
+
+输入文字加图片
+→ content = [
+    { type: "text", text: "帮我看这张图" },
+    { type: "image", data: "...", mimeType: "image/png" },
+  ]
+```
+
+因此 `convertToLlmWithBlockImages(...)` 中：
+
+```text
+converted.map(...)
+→ 逐条处理所有转换后的模型消息。
+
+user / toolResult + content 是数组
+→ 用 content.some(...) 检查是否包含图片。
+
+hasImages = true
+→ 才会用 content.map(...) 把图片块替换为 “Image reading is disabled.”。
+
+hello 这类纯文字
+→ 仍会检查数组，但 hasImages = false，原消息不变。
+```
+
 ## 每日记录模板
 
 ### Day N：主题

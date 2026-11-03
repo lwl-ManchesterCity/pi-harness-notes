@@ -264,24 +264,34 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// 从用户选中的工具或默认工具开始，逐个过滤掉排除名单中的工具，得到初始启用列表。
 	const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
 
+	// 将 Pi 的 session 消息转换为模型消息；若设置禁止读图，再把图片内容替换为提示文字。
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
+		// 先使用通用转换，得到可直接发送给模型的 Message[]。
 		const converted = convertToLlm(messages);
+		// 未开启“禁止图片读取”时，不修改图片内容，直接返回转换结果。
 		if (!settingsManager.getBlockImages()) {
 			return converted;
 		}
+		// 逐条生成新的模型消息；只有用户消息和工具结果可能含有要屏蔽的图片。
 		return converted.map((msg) => {
 			if (msg.role === "user" || msg.role === "toolResult") {
 				const content = msg.content;
+				// 纯文字 content 不可能含图片；只有内容块数组才继续检查。
 				if (Array.isArray(content)) {
+					// 数组中至少有一张图片时，才创建替换后的内容数组。
 					const hasImages = content.some((c) => c.type === "image");
 					if (hasImages) {
+						// 图片块改为文字提示；其他文字或内容块原样保留。
 						const filteredContent = content
 							.map((c) =>
+								// as const 让 TypeScript 把 type 固定识别为 "text"，符合文字内容块格式。
 								c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
 							)
+							// 连续多张图片会生成重复提示；这里只保留第一条，移除后面相邻的同样提示。
 							.filter(
 								(c, i, arr) =>
 									!(
+										// 当前是提示文字、不是数组第一项，且前一项也是相同提示时，返回 false 将它过滤掉。
 										c.type === "text" &&
 										c.text === "Image reading is disabled." &&
 										i > 0 &&
@@ -289,53 +299,84 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
 									),
 							);
+						// ...msg 复制原消息字段，只把 content 换成已屏蔽图片的 filteredContent。
 						return { ...msg, content: filteredContent };
 					}
 				}
 			}
+			// 不属于目标角色、内容不是数组或不含图片时，原消息不变。
 			return msg;
 		});
 	};
 
+	// 缓存预热器会在模型提示词缓存快过期时发送小型刷新请求；此处先准备给它的依赖。
+	// ExtensionRunner 还未创建，因此先用这个空盒子保存它；后面创建完成后再写入 current。
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 	const cacheWarmer = new CacheWarmer(
+			// 之后用模型运行环境发送刷新缓存的模型请求。
 		modelRuntime,
+			// 之后读取当前 session 历史、记录刷新请求的用量。
 		sessionManager,
+			// 每次需要判断时再读取当前缓存预热设置。
 		() => settingsManager.getCacheWarmingMode(),
+			// 扩展已准备好时可改变本次预热决定；没有扩展时使用 Pi 原本的 event.action。
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
 	);
+
+	// 每次请求模型前，合并本次调用传入的设置与 Pi 配置中的超时、重试、请求头设置。
 	const buildRequestOptions = (
+		// 本次实际要请求的模型；后面用于生成该 provider 的请求头。
 		requestModel: Model<any>,
+		// 调用者没有额外传入请求设置时，默认使用空对象。
 		options: ModelsSimpleStreamOptions = {},
 	): ModelsSimpleStreamOptions => {
+		// 读取 Pi 设置中 provider 的默认超时和重试配置。
 		const providerRetrySettings = settingsManager.getProviderRetrySettings();
+		// 读取“请求没有新数据时最多等待多久”的空闲超时设置。
 		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+		// 设置为 0 表示不设空闲超时；用一个很大的毫秒数近似表示。
 		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+		// 取出后面创建好的扩展运行器；它可能仍不存在，因此后续调用前会检查。
 		const headerRunner = extensionRunnerRef.current;
 		return {
+			// 先保留调用者本次传入的其他请求选项。
 			...options,
+			// 超时优先级：本次调用的 timeoutMs → Pi 配置 → 0 被转换后的无空闲超时值。
 			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
+			// WebSocket 连接超时：本次调用优先，没有时读取 Pi 配置。
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
+			// 重试次数和每次重试的最大等待时间：本次调用优先，没有时读取 Pi 配置。
 			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
 			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+
+			// 真正发送模型网络请求前执行：先补充 Pi 的 Provider/session 请求头，再允许扩展最后修改。
 			transformHeaders: async (requestHeaders) => {
+				// 合并调用者原有请求头、当前模型、Pi 设置和本次 session 所需的 Provider 标识信息。
 				const headers = mergeProviderAttributionHeaders(
 					requestModel,
 					settingsManager,
 					options.sessionId,
 					requestHeaders,
 				);
+				// 有扩展注册 before_provider_headers 时交给扩展处理；没有时直接使用合并结果。
+				// headers 为空时用 {}，保证最终传出的始终是请求头对象。
 				return headerRunner?.hasHandlers("before_provider_headers")
 					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
 					: (headers ?? {});
 			},
 		};
 	};
+
+	// 为缓存预热器生成一个“之后再检查”的函数：之前记住的消息，是否仍原样处于当前消息的开头。
 	const cacheContextIsCurrent = (requestModel: Model<any>) => {
+		// 先记住准备预热时的消息数组；返回的函数在未来执行时会与当前消息比较。
 		const messages = agent.state.messages;
 		return () => {
+			// 预热真正发生前，重新读取 Agent 此刻使用的模型和消息。
 			const currentModel = agent.state.model;
 			const currentMessages = agent.state.messages;
+		// 模型未变，且之前记住的每条消息仍在当前历史开头的相同位置时，返回 true。
+		// 切换模型、历史被替换或变短时，返回 false。
 			return (
 				currentModel.provider === requestModel.provider &&
 				currentModel.id === requestModel.id &&
@@ -344,26 +385,40 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 		};
 	};
+
+	// 模型 Provider 请求真正发出前执行：扩展可在这里查看或修改本次请求内容。
 	const transformProviderPayload = async (payload: unknown) => {
+		// 取出已创建的扩展运行器；当前阶段它也可能不存在。
 		const runner = extensionRunnerRef.current;
+		// 没有扩展注册 before_provider_request 时，请求内容保持原样。
 		if (!runner?.hasHandlers("before_provider_request")) return payload;
+		// 交给扩展处理；扩展返回的内容会成为实际发送给 Provider 的请求内容。
 		return runner.emitBeforeProviderRequest(payload);
 	};
+
+	// Provider 返回 HTTP 响应后调用；这里只通知扩展，不修改响应或 session。
 	const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
+		// 取出已创建的扩展运行器；可能不存在。
 		const runner = extensionRunnerRef.current;
+		// runner 不存在，或没有扩展监听 after_provider_response 时，直接结束。
 		if (!runner?.hasHandlers("after_provider_response")) return;
+		// 将 Provider 的状态码和响应头发送给监听此事件的扩展。
 		await runner.emit({
 			type: "after_provider_response",
 			status: response.status,
 			headers: response.headers,
 		});
 	};
+	// 模型流式输出期间，每收到一个 Provider 数据片段就调用；不同于上面的 HTTP 响应事件只通知一次。
 	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
 		data,
 		model,
 	) => {
+		// 取出已创建的扩展运行器；可能不存在。
 		const runner = extensionRunnerRef.current;
+		// 没有扩展监听 provider_stream_event 时，不处理当前流式片段。
 		if (!runner?.hasHandlers("provider_stream_event")) return;
+		// 将当前片段和本次模型的 Provider、API、模型名通知给扩展。
 		await runner.emit({
 			data,
 			type: "provider_stream_event",
@@ -373,73 +428,116 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 	};
 
+	// 创建真正负责模型请求和工具调用循环的 Agent；下方才会用它创建产品层的 AgentSession。
 	const agent = new Agent({
+		// Agent 刚创建时保存的初始状态包。
 		initialState: {
+			// 系统提示词和工具稍后由 AgentSession 与资源加载流程补充；此刻先为空。
 			systemPrompt: "",
+			// 前面已确定的本次模型和思考等级。
 			model,
 			thinkingLevel,
+			// 工具同样在后面注册；恢复旧 session 时带入已有聊天历史，新 session 时通常为空数组。
 			tools: [],
 			messages: existingSession.messages,
 		},
+		// 将 Pi 的消息格式转换为模型所需格式；开启图片屏蔽时会先替换图片内容。
 		convertToLlm: convertToLlmWithBlockImages,
+
+		// Agent 以后需要模型回答时调用这里：整理请求设置、按需启动缓存预热，再真正发送流式模型请求。
 		streamFn: async (model, context, options) => {
+			// 合并本次请求传入的设置与 Pi 的超时、重试、请求头配置。
 			const requestOptions = buildRequestOptions(model, options);
+			// 只有请求属于当前 session 时，才让缓存预热器跟踪这次模型请求。
 			if (options?.sessionId === sessionManager.getSessionId()) {
+				// 保存模型、上下文和最终请求设置；第二个参数供之后确认上下文是否仍相同。
 				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
 			}
+			// 真正向 Provider 发送流式请求；Agent 会继续读取它返回的文字和工具调用等事件。
 			return modelRuntime.streamSimple(model, context, requestOptions);
 		},
-		onPayload: transformProviderPayload,
-		onResponse: handleProviderResponse,
-		onProviderStreamEvent: handleProviderStreamEvent,
+
+		// 以下函数此刻不执行，交给 Agent 保存；之后 Agent 启动模型循环时，在对应阶段调用它们。
+		onPayload: transformProviderPayload, // 请求发给 Provider 前处理请求内容。
+		onResponse: handleProviderResponse, // Provider 返回一次 HTTP 响应后通知扩展。
+		onProviderStreamEvent: handleProviderStreamEvent, // 每收到一个流式片段时通知扩展。
+		// 当前 session 的 ID；Agent 后续创建模型循环配置时会继续传入。
 		sessionId: sessionManager.getSessionId(),
+
+		// 每次模型请求前处理完整消息上下文；扩展可在这里补充、删除或改写消息。
 		transformContext: async (messages) => {
+			// 取出已创建的扩展运行器；可能不存在。
 			const runner = extensionRunnerRef.current;
+			// 没有扩展时，完整上下文不作修改，原样交回 Agent。
 			if (!runner) return messages;
+			// 有扩展时，将完整消息数组交给扩展；扩展返回的数组成为最终模型上下文。
 			return runner.emitContext(messages);
 		},
-		steeringMode: settingsManager.getSteeringMode(),
-		followUpMode: settingsManager.getFollowUpMode(),
-		transport: settingsManager.getTransport(),
-		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		// 以下运行规则直接从 Pi 设置读取，交给 Agent 保存；具体处理发生在之后的 Agent 模型循环中。
+		steeringMode: settingsManager.getSteeringMode(), // Agent 回答中用户又输入消息时的处理方式。
+		followUpMode: settingsManager.getFollowUpMode(), // 当前回答结束后，等待消息的处理方式。
+		transport: settingsManager.getTransport(), // 请求模型时使用的传输方式。
+		thinkingBudgets: settingsManager.getThinkingBudgets(), // 各思考等级对应的额度设置。
+		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs, // 重试请求每次最多等待多久。
 	});
 
+	// 将本次使用的模型和思考等级写入 session 历史，供之后恢复 session 时读取。
 	if (hasExistingSession) {
+		// 旧 session 通常已有模型记录；只有历史缺少思考等级记录时才补写。
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
 	} else {
+		// 新 session 尚无历史；先记录它从哪个模型开始。
 		if (model) {
 			sessionManager.appendModelChange(model.provider, model.id);
 		}
+		// 无论模型是否可用，都记录本次初始思考等级。
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
+	// 创建 Pi 的 AgentSession：它管理对话历史、设置、资源、工具和扩展，并在内部使用上面创建的 Agent。
 	const session = new AgentSession({
-		agent,
-		sessionManager,
-		settingsManager,
-		cwd,
+		agent, // 刚创建的模型请求与工具调用循环对象。
+		sessionManager, // 当前 session 的历史记录和 session 文件管理器。
+		settingsManager, // 当前项目与 Pi 全局设置。
+		cwd, // 当前 session 所属项目目录。
+		// 用户本次可切换的模型范围；未指定时为 undefined，不额外限制。
 		scopedModels: options.scopedModels,
+		// 已加载项目 extensions、skills、提示词模板等资源的加载器。
 		resourceLoader,
+		// 调用者额外传入的自定义工具；未传时为 undefined。
 		customTools: options.customTools,
+		// 查询模型、认证状态和刷新模型信息所需的运行环境。
 		modelRuntime,
+		// 前面创建的提示词缓存预热器；AgentSession 会在合适时机通知它。
 		cacheWarmer,
+		// 启动时实际先启用的工具：用户选择或默认工具列表，并已去除 --exclude-tools 指定的名称。
 		initialActiveToolNames,
+		// 用户未直接指定工具列表，或使用 +write、-bash 这类修改符号，且未要求禁用工具时，表示本次使用默认工具规则。
 		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
+		// 用户传入的 +工具、-工具修改符号；AgentSession 之后可据此重新计算默认工具。
 		defaultToolModifiers: toolModifiers,
+		// 整个 session 期间只允许使用的工具名单；undefined 表示不设置这项限制。
 		allowedToolNames,
+		// 用户通过 --exclude-tools 指定的禁止工具名单。
 		excludedToolNames,
+		// 供 AgentSession 创建扩展运行器后写入的共享引用；前面 Agent 的 Hook 也通过它取得运行器。
 		extensionRunnerRef,
+		// 本次为何开始 session，例如首次启动、new、resume 或 fork。
 		sessionStartEvent: options.sessionStartEvent,
 	});
 
+	// 取出前面已加载的扩展结果；这里只读取，不会重新加载项目资源。
 	const extensionsResult = resourceLoader.getExtensions();
 
+	// createAgentSession(...) 的最终结果：交回 agent-session-services.ts 的 createAgentSessionFromServices(...)。
 	return {
+		// 刚创建好的 Pi 对话 session，内部包含 Agent、历史、资源和工具管理。
 		session,
+		// 已加载扩展提供的结果，后续界面等逻辑可据此取得扩展信息。
 		extensionsResult,
+		// 恢复旧模型失败时的可选提示；正常情况为 undefined。
 		modelFallbackMessage,
 	};
 }

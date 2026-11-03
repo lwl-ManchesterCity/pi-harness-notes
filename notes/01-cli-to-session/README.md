@@ -16,4 +16,4 @@ cli.ts
   → new AgentSession(...)
 ```
 
-每天的学习过程保存在 [daily/](daily/)；汇总笔记在 [week-1-cli-agent-session.md](daily/week-1-cli-agent-session.md)。
+本目录直接保存每天的学习过程；汇总笔记是 [week-1-cli-agent-session.md](week-1-cli-agent-session.md)。

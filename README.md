@@ -2,6 +2,10 @@
 
 学习 Pi Harness 源码的公开笔记。目标是用 8 周理解 Pi 的单 Agent Loop、Session、工具、上下文管理与 Durable Harness，为独立设计 Multi-Agent Coding Agent 打基础。
 
+## 交互式学习网络
+
+[在线查看 Pi 源码学习网络](https://lwl-manchestercity.github.io/pi-harness-notes/)。也可以在本地直接用浏览器打开 [docs/index.html](docs/index.html)。拖动节点或画布、滚轮缩放，点击节点查看说明与源码链接。
+
 ## 笔记导航
 
 - [00 链路概述与学习计划](notes/00-overview/)
